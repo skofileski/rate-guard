@@ -1,0 +1,35 @@
+{
+	"name": "rate-guard",
+	"version": "1.0.0",
+	"description": "A lightweight rate limiting middleware with pluggable storage backends",
+	"main": "src/index.js",
+	"scripts": {
+		"start": "node src/index.js",
+		"test": "node --test test/",
+		"lint": "eslint src/"
+	},
+	"keywords": [
+		"rate-limit",
+		"middleware",
+		"express",
+		"api",
+		"throttle"
+	],
+	"author": "",
+	"license": "MIT",
+	"engines": {
+		"node": ">=18.0.0"
+	},
+	"peerDependencies": {
+		"redis": ">=4.0.0",
+		"mongodb": ">=5.0.0"
+	},
+	"peerDependenciesMeta": {
+		"redis": {
+			"optional": true
+		},
+		"mongodb": {
+			"optional": true
+		}
+	}
+}
