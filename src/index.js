@@ -1,92 +1,104 @@
-const MemoryStore = require('./stores/memory');
-const { SlidingWindowLimiter, TokenBucketLimiter } = require('./limiters');
-
 /**
- * Default key generator - uses IP address
+ * rate-guard
+ * A lightweight rate limiting middleware with pluggable storage backends
  */
-const defaultKeyGenerator = (req) => {
-	return req.ip || req.connection.remoteAddress || 'unknown';
-};
+
+const { SlidingWindowLimiter, TokenBucketLimiter } = require('./limiters');
+const { MemoryStore } = require('./stores/memory');
+const { RedisStore } = require('./stores/redis');
+const { MongoStore } = require('./stores/mongo');
+const { RuleEngine } = require('./rules');
 
 /**
- * Creates a rate limiting middleware
+ * Create rate limiting middleware
  * @param {Object} options - Configuration options
- * @param {number} options.windowMs - Time window in milliseconds (default: 60000)
- * @param {number} options.maxRequests - Maximum requests per window (default: 100)
- * @param {string} options.algorithm - 'sliding-window' or 'token-bucket' (default: 'sliding-window')
- * @param {Object} options.store - Storage adapter instance (default: MemoryStore)
- * @param {Function} options.keyGenerator - Function to generate unique client keys
- * @param {Object} options.tiers - User tier configurations { tierName: { maxRequests, windowMs } }
- * @param {Function} options.tierResolver - Function to resolve user tier from request
  * @returns {Function} Express middleware function
  */
-function rateGuard(options = {}) {
-	const {
-		windowMs = 60000,
-		maxRequests = 100,
-		algorithm = 'sliding-window',
-		store = new MemoryStore(),
-		keyGenerator = defaultKeyGenerator,
-		tiers = null,
-		tierResolver = null
-	} = options;
+function createRateLimiter(options = {}) {
+  const {
+    store = new MemoryStore(),
+    algorithm = 'sliding-window',
+    windowMs = 60000,
+    maxRequests = 100,
+    keyGenerator = defaultKeyGenerator,
+    tierExtractor = () => null,
+    skipFailedRequests = false,
+    onLimitReached = null,
+    rules = null
+  } = options;
 
-	// Create the appropriate limiter based on algorithm
-	const createLimiter = (max, window) => {
-		if (algorithm === 'token-bucket') {
-			return new TokenBucketLimiter(store, max, window);
-		}
-		return new SlidingWindowLimiter(store, max, window);
-	};
+  const ruleEngine = rules instanceof RuleEngine ? rules : new RuleEngine({
+    windowMs,
+    maxRequests,
+    algorithm
+  });
 
-	return async function rateLimitMiddleware(req, res, next) {
-		try {
-			const key = keyGenerator(req);
-			
-			// Resolve tier-specific limits if configured
-			let effectiveMax = maxRequests;
-			let effectiveWindow = windowMs;
-			
-			if (tiers && tierResolver) {
-				const tier = await tierResolver(req);
-				if (tier && tiers[tier]) {
-					effectiveMax = tiers[tier].maxRequests || maxRequests;
-					effectiveWindow = tiers[tier].windowMs || windowMs;
-				}
-			}
+  const limiters = {
+    'sliding-window': (opts) => new SlidingWindowLimiter(store, opts),
+    'token-bucket': (opts) => new TokenBucketLimiter(store, opts)
+  };
 
-			const limiter = createLimiter(effectiveMax, effectiveWindow);
-			const result = await limiter.consume(key);
+  return async function rateLimitMiddleware(req, res, next) {
+    try {
+      const tier = await tierExtractor(req);
+      const route = req.path || req.url;
+      const rule = ruleEngine.getRule(route, tier);
+      
+      const key = ruleEngine.generateKey({
+        ip: req.ip || req.connection?.remoteAddress,
+        userId: req.user?.id,
+        route,
+        tier
+      });
 
-			// Set rate limit headers
-			res.setHeader('X-RateLimit-Limit', effectiveMax);
-			res.setHeader('X-RateLimit-Remaining', result.remaining);
-			res.setHeader('X-RateLimit-Reset', result.resetTime);
+      const LimiterClass = limiters[rule.algorithm];
+      if (!LimiterClass) {
+        throw new Error(`Unknown algorithm: ${rule.algorithm}`);
+      }
 
-			if (!result.allowed) {
-				res.setHeader('Retry-After', Math.ceil((result.resetTime - Date.now()) / 1000));
-				return res.status(429).json({
-					error: 'Too Many Requests',
-					message: 'Rate limit exceeded. Please try again later.',
-					retryAfter: Math.ceil((result.resetTime - Date.now()) / 1000)
-				});
-			}
+      const limiter = LimiterClass(rule);
+      const result = await limiter.consume(key);
 
-			next();
-		} catch (error) {
-			// Fail open - allow request if rate limiter fails
-			console.error('Rate limiter error:', error);
-			next();
-		}
-	};
+      // Set rate limit headers
+      res.set('X-RateLimit-Limit', result.limit);
+      res.set('X-RateLimit-Remaining', result.remaining);
+      res.set('X-RateLimit-Reset', result.resetTime);
+
+      if (!result.allowed) {
+        res.set('Retry-After', Math.ceil((result.resetTime - Date.now()) / 1000));
+        
+        if (onLimitReached) {
+          return onLimitReached(req, res, next, result);
+        }
+
+        return res.status(429).json({
+          error: 'Too Many Requests',
+          retryAfter: Math.ceil((result.resetTime - Date.now()) / 1000)
+        });
+      }
+
+      next();
+    } catch (error) {
+      // Fail open - allow request if rate limiter fails
+      console.error('Rate limiter error:', error);
+      next();
+    }
+  };
 }
 
-// Export main function and utilities
-module.exports = rateGuard;
-module.exports.MemoryStore = MemoryStore;
-module.exports.SlidingWindowLimiter = SlidingWindowLimiter;
-module.exports.TokenBucketLimiter = TokenBucketLimiter;
+/**
+ * Default key generator
+ */
+function defaultKeyGenerator(req) {
+  return req.ip || req.connection?.remoteAddress || 'unknown';
+}
 
-// Lazy load optional stores
-module.exports.RedisStore = require('./stores/redis');
-module.exports.MongoStore = require('./stores/mongo');
+module.exports = {
+  createRateLimiter,
+  RuleEngine,
+  SlidingWindowLimiter,
+  TokenBucketLimiter,
+  MemoryStore,
+  RedisStore,
+  MongoStore
+};
