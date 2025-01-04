@@ -1,35 +1,52 @@
 {
-	"name": "rate-guard",
-	"version": "1.0.0",
-	"description": "A lightweight rate limiting middleware with pluggable storage backends",
-	"main": "src/index.js",
-	"scripts": {
-		"start": "node src/index.js",
-		"test": "node --test test/",
-		"lint": "eslint src/"
-	},
-	"keywords": [
-		"rate-limit",
-		"middleware",
-		"express",
-		"api",
-		"throttle"
-	],
-	"author": "",
-	"license": "MIT",
-	"engines": {
-		"node": ">=18.0.0"
-	},
-	"peerDependencies": {
-		"redis": ">=4.0.0",
-		"mongodb": ">=5.0.0"
-	},
-	"peerDependenciesMeta": {
-		"redis": {
-			"optional": true
-		},
-		"mongodb": {
-			"optional": true
-		}
-	}
+  "name": "rate-guard",
+  "version": "0.1.0",
+  "description": "A lightweight rate limiting middleware with pluggable storage backends",
+  "main": "src/index.js",
+  "types": "types/index.d.ts",
+  "scripts": {
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage",
+    "lint": "eslint src/",
+    "lint:fix": "eslint src/ --fix"
+  },
+  "keywords": [
+    "rate-limit",
+    "rate-limiting",
+    "middleware",
+    "express",
+    "redis",
+    "mongodb",
+    "token-bucket",
+    "sliding-window"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {},
+  "peerDependencies": {
+    "ioredis": "^5.0.0",
+    "mongodb": "^6.0.0"
+  },
+  "peerDependenciesMeta": {
+    "ioredis": {
+      "optional": true
+    },
+    "mongodb": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "eslint": "^8.50.0",
+    "jest": "^29.7.0",
+    "ioredis": "^5.3.0",
+    "mongodb": "^6.1.0"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "files": [
+    "src/",
+    "types/"
+  ]
 }
