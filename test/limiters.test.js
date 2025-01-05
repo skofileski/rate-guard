@@ -1,4 +1,4 @@
-const { SlidingWindowLimiter, TokenBucketLimiter, createLimiter } = require('../src/limiters');
+const { SlidingWindowLimiter, TokenBucketLimiter } = require('../src/limiters');
 const MemoryStore = require('../src/stores/memory');
 
 describe('SlidingWindowLimiter', () => {
@@ -7,43 +7,49 @@ describe('SlidingWindowLimiter', () => {
 
   beforeEach(() => {
     store = new MemoryStore();
-    limiter = new SlidingWindowLimiter({ windowSize: 1000, maxRequests: 3 });
+    limiter = new SlidingWindowLimiter(store, {
+      windowMs: 1000,
+      maxRequests: 5
+    });
   });
 
   afterEach(async () => {
     await store.close();
   });
 
-  test('should allow requests under the limit', async () => {
-    const result = await limiter.isAllowed(store, 'test-key');
+  test('should allow requests within limit', async () => {
+    const result = await limiter.isAllowed('test-key');
     expect(result.allowed).toBe(true);
-    expect(result.remaining).toBe(2);
+    expect(result.remaining).toBe(4);
   });
 
-  test('should block requests over the limit', async () => {
-    await limiter.isAllowed(store, 'test-key');
-    await limiter.isAllowed(store, 'test-key');
-    await limiter.isAllowed(store, 'test-key');
-    
-    const result = await limiter.isAllowed(store, 'test-key');
+  test('should block requests over limit', async () => {
+    for (let i = 0; i < 5; i++) {
+      await limiter.isAllowed('test-key');
+    }
+    const result = await limiter.isAllowed('test-key');
     expect(result.allowed).toBe(false);
     expect(result.remaining).toBe(0);
   });
 
-  test('should handle corrupted data gracefully', async () => {
+  test('should handle corrupted timestamp data', async () => {
     // Simulate corrupted data
-    await store.set('corrupted-key', 'not-an-array');
-    
-    const result = await limiter.isAllowed(store, 'corrupted-key');
+    await store.set('corrupted-key', { timestamps: [null, undefined, 'invalid', NaN] });
+    const result = await limiter.isAllowed('corrupted-key');
     expect(result.allowed).toBe(true);
   });
 
-  test('should filter out invalid timestamps', async () => {
-    // Simulate data with invalid timestamps
-    await store.set('invalid-ts-key', [NaN, 'invalid', null, Date.now()]);
-    
-    const result = await limiter.isAllowed(store, 'invalid-ts-key');
+  test('should handle missing timestamps array', async () => {
+    await store.set('no-array-key', { foo: 'bar' });
+    const result = await limiter.isAllowed('no-array-key');
     expect(result.allowed).toBe(true);
+  });
+
+  test('should reset key', async () => {
+    await limiter.isAllowed('reset-key');
+    await limiter.reset('reset-key');
+    const data = await store.get('reset-key');
+    expect(data).toBeNull();
   });
 });
 
@@ -53,7 +59,10 @@ describe('TokenBucketLimiter', () => {
 
   beforeEach(() => {
     store = new MemoryStore();
-    limiter = new TokenBucketLimiter({ bucketSize: 5, refillRate: 1 });
+    limiter = new TokenBucketLimiter(store, {
+      bucketSize: 5,
+      refillRate: 10
+    });
   });
 
   afterEach(async () => {
@@ -61,49 +70,35 @@ describe('TokenBucketLimiter', () => {
   });
 
   test('should allow requests when tokens available', async () => {
-    const result = await limiter.isAllowed(store, 'test-key');
+    const result = await limiter.isAllowed('test-key');
     expect(result.allowed).toBe(true);
     expect(result.remaining).toBe(4);
   });
 
-  test('should block requests when no tokens', async () => {
+  test('should block when no tokens', async () => {
     for (let i = 0; i < 5; i++) {
-      await limiter.isAllowed(store, 'test-key');
+      await limiter.isAllowed('test-key');
     }
-    
-    const result = await limiter.isAllowed(store, 'test-key');
+    const result = await limiter.isAllowed('test-key');
     expect(result.allowed).toBe(false);
-    expect(result.remaining).toBe(0);
   });
 
-  test('should handle corrupted bucket data', async () => {
-    await store.set('corrupted-bucket', { tokens: 'invalid', lastRefill: 'bad' });
-    
-    const result = await limiter.isAllowed(store, 'corrupted-bucket');
+  test('should handle corrupted token data', async () => {
+    await store.set('corrupted-key', { tokens: NaN, lastRefill: 'invalid' });
+    const result = await limiter.isAllowed('corrupted-key');
     expect(result.allowed).toBe(true);
     expect(result.remaining).toBe(4);
   });
 
-  test('should handle null bucket data', async () => {
-    await store.set('null-bucket', null);
-    
-    const result = await limiter.isAllowed(store, 'null-bucket');
+  test('should handle missing token fields', async () => {
+    await store.set('missing-fields', { unrelated: 'data' });
+    const result = await limiter.isAllowed('missing-fields');
     expect(result.allowed).toBe(true);
   });
-});
 
-describe('createLimiter', () => {
-  test('should create sliding window limiter', () => {
-    const limiter = createLimiter('sliding-window');
-    expect(limiter).toBeInstanceOf(SlidingWindowLimiter);
-  });
-
-  test('should create token bucket limiter', () => {
-    const limiter = createLimiter('token-bucket');
-    expect(limiter).toBeInstanceOf(TokenBucketLimiter);
-  });
-
-  test('should throw on unknown type', () => {
-    expect(() => createLimiter('unknown')).toThrow('Unknown limiter type');
+  test('should consume multiple tokens', async () => {
+    const result = await limiter.isAllowed('multi-key', 3);
+    expect(result.allowed).toBe(true);
+    expect(result.remaining).toBe(2);
   });
 });

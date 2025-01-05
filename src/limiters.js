@@ -2,182 +2,138 @@
  * Rate limiting algorithm implementations
  */
 
-/**
- * Sliding Window Rate Limiter
- * Tracks requests within a time window that slides forward
- */
 class SlidingWindowLimiter {
-  constructor(options = {}) {
-    this.windowSize = options.windowSize || 60000; // Default 1 minute
+  constructor(store, options = {}) {
+    this.store = store;
+    this.windowMs = options.windowMs || 60000;
     this.maxRequests = options.maxRequests || 100;
   }
 
-  /**
-   * Check if request is allowed under the sliding window
-   * @param {object} store - Storage adapter instance
-   * @param {string} key - Unique identifier for the client
-   * @returns {Promise<object>} Result with allowed status and metadata
-   */
-  async isAllowed(store, key) {
+  async isAllowed(key) {
     const now = Date.now();
-    const windowStart = now - this.windowSize;
+    const windowStart = now - this.windowMs;
 
-    // Get current timestamps
-    let timestamps = await store.get(key) || [];
+    // Get current window data
+    let data = await this.store.get(key);
     
-    // Ensure timestamps is an array (handle corrupted data)
-    if (!Array.isArray(timestamps)) {
-      timestamps = [];
+    if (!data) {
+      data = { timestamps: [] };
     }
 
-    // Filter out timestamps outside the current window
-    // Also filter out any invalid/NaN timestamps
-    const validTimestamps = timestamps.filter(ts => {
+    // Ensure timestamps is always an array
+    if (!Array.isArray(data.timestamps)) {
+      data.timestamps = [];
+    }
+
+    // Filter out expired timestamps and handle invalid entries
+    data.timestamps = data.timestamps.filter(ts => {
       const timestamp = Number(ts);
-      return !isNaN(timestamp) && timestamp > windowStart && timestamp <= now;
+      return !isNaN(timestamp) && timestamp > windowStart;
     });
 
-    const requestCount = validTimestamps.length;
+    const currentCount = data.timestamps.length;
 
-    if (requestCount >= this.maxRequests) {
-      // Find the oldest timestamp to calculate retry time
-      const oldestTimestamp = Math.min(...validTimestamps);
-      const retryAfter = Math.max(0, Math.ceil((oldestTimestamp + this.windowSize - now) / 1000));
-      
+    if (currentCount >= this.maxRequests) {
+      const oldestTimestamp = Math.min(...data.timestamps);
+      const resetTime = oldestTimestamp + this.windowMs;
       return {
         allowed: false,
         remaining: 0,
-        retryAfter,
-        limit: this.maxRequests,
-        windowSize: this.windowSize
+        resetAt: resetTime,
+        total: this.maxRequests
       };
     }
 
-    // Add current timestamp and save
-    validTimestamps.push(now);
-    await store.set(key, validTimestamps, this.windowSize);
+    // Add current timestamp
+    data.timestamps.push(now);
+    await this.store.set(key, data, this.windowMs);
 
     return {
       allowed: true,
-      remaining: this.maxRequests - validTimestamps.length,
-      retryAfter: 0,
-      limit: this.maxRequests,
-      windowSize: this.windowSize
+      remaining: this.maxRequests - currentCount - 1,
+      resetAt: now + this.windowMs,
+      total: this.maxRequests
     };
   }
 
-  /**
-   * Reset the rate limit for a key
-   * @param {object} store - Storage adapter instance
-   * @param {string} key - Unique identifier for the client
-   */
-  async reset(store, key) {
-    await store.delete(key);
+  async reset(key) {
+    await this.store.delete(key);
   }
 }
 
-/**
- * Token Bucket Rate Limiter
- * Allows bursts while maintaining average rate
- */
 class TokenBucketLimiter {
-  constructor(options = {}) {
-    this.bucketSize = options.bucketSize || 100; // Max tokens
-    this.refillRate = options.refillRate || 10; // Tokens per second
-    this.refillInterval = options.refillInterval || 1000; // Refill check interval
+  constructor(store, options = {}) {
+    this.store = store;
+    this.bucketSize = options.bucketSize || 10;
+    this.refillRate = options.refillRate || 1; // tokens per second
+    this.refillInterval = 1000 / this.refillRate;
   }
 
-  /**
-   * Check if request is allowed and consume a token
-   * @param {object} store - Storage adapter instance
-   * @param {string} key - Unique identifier for the client
-   * @param {number} tokens - Number of tokens to consume (default 1)
-   * @returns {Promise<object>} Result with allowed status and metadata
-   */
-  async isAllowed(store, key, tokens = 1) {
+  async isAllowed(key, tokensRequired = 1) {
     const now = Date.now();
-    let bucket = await store.get(key);
+    let data = await this.store.get(key);
 
-    // Initialize bucket if it doesn't exist or is invalid
-    if (!bucket || typeof bucket !== 'object' || typeof bucket.tokens !== 'number') {
-      bucket = {
+    if (!data || typeof data.tokens !== 'number' || isNaN(data.tokens)) {
+      data = {
         tokens: this.bucketSize,
         lastRefill: now
       };
     }
 
     // Ensure lastRefill is valid
-    if (typeof bucket.lastRefill !== 'number' || isNaN(bucket.lastRefill)) {
-      bucket.lastRefill = now;
+    if (typeof data.lastRefill !== 'number' || isNaN(data.lastRefill)) {
+      data.lastRefill = now;
     }
 
     // Calculate tokens to add based on time elapsed
-    const timePassed = Math.max(0, now - bucket.lastRefill);
-    const tokensToAdd = Math.floor((timePassed / 1000) * this.refillRate);
+    const timePassed = Math.max(0, now - data.lastRefill);
+    const tokensToAdd = Math.floor(timePassed / this.refillInterval);
     
-    // Refill the bucket (cap at bucket size)
-    bucket.tokens = Math.min(this.bucketSize, bucket.tokens + tokensToAdd);
+    // Refill bucket (cap at bucket size)
+    data.tokens = Math.min(this.bucketSize, data.tokens + tokensToAdd);
     
-    // Only update lastRefill if tokens were actually added
     if (tokensToAdd > 0) {
-      bucket.lastRefill = now;
+      data.lastRefill = now;
     }
 
-    // Ensure tokens doesn't go below 0 due to any edge cases
-    bucket.tokens = Math.max(0, bucket.tokens);
-
-    if (bucket.tokens < tokens) {
-      // Calculate when enough tokens will be available
-      const tokensNeeded = tokens - bucket.tokens;
-      const retryAfter = Math.ceil(tokensNeeded / this.refillRate);
-
-      // Still save the refilled state
-      await store.set(key, bucket);
+    // Check if enough tokens available
+    if (data.tokens >= tokensRequired) {
+      data.tokens -= tokensRequired;
+      await this.store.set(key, data);
 
       return {
-        allowed: false,
-        remaining: Math.floor(bucket.tokens),
-        retryAfter,
-        limit: this.bucketSize,
-        refillRate: this.refillRate
+        allowed: true,
+        remaining: Math.floor(data.tokens),
+        resetAt: now + (this.bucketSize - data.tokens) * this.refillInterval,
+        total: this.bucketSize
       };
     }
 
-    // Consume tokens
-    bucket.tokens -= tokens;
-    await store.set(key, bucket);
+    // Calculate when enough tokens will be available
+    const tokensNeeded = tokensRequired - data.tokens;
+    const waitTime = Math.ceil(tokensNeeded * this.refillInterval);
+
+    await this.store.set(key, data);
 
     return {
-      allowed: true,
-      remaining: Math.floor(bucket.tokens),
-      retryAfter: 0,
-      limit: this.bucketSize,
-      refillRate: this.refillRate
+      allowed: false,
+      remaining: Math.floor(data.tokens),
+      resetAt: now + waitTime,
+      total: this.bucketSize
     };
   }
 
-  /**
-   * Reset the bucket for a key
-   * @param {object} store - Storage adapter instance
-   * @param {string} key - Unique identifier for the client
-   */
-  async reset(store, key) {
-    await store.delete(key);
+  async reset(key) {
+    await this.store.delete(key);
   }
 }
 
-/**
- * Factory function to create a limiter instance
- * @param {string} type - Type of limiter ('sliding-window' or 'token-bucket')
- * @param {object} options - Limiter configuration options
- * @returns {SlidingWindowLimiter|TokenBucketLimiter}
- */
-function createLimiter(type, options = {}) {
+function createLimiter(type, store, options) {
   switch (type) {
     case 'sliding-window':
-      return new SlidingWindowLimiter(options);
+      return new SlidingWindowLimiter(store, options);
     case 'token-bucket':
-      return new TokenBucketLimiter(options);
+      return new TokenBucketLimiter(store, options);
     default:
       throw new Error(`Unknown limiter type: ${type}`);
   }
