@@ -12,52 +12,42 @@ class SlidingWindowLimiter {
   async isAllowed(key) {
     const now = Date.now();
     const windowStart = now - this.windowMs;
-
-    // Get current window data
-    let data = await this.store.get(key);
     
-    if (!data) {
-      data = { timestamps: [] };
-    }
-
-    // Ensure timestamps is always an array
-    if (!Array.isArray(data.timestamps)) {
-      data.timestamps = [];
-    }
-
-    // Filter out expired timestamps and handle invalid entries
-    data.timestamps = data.timestamps.filter(ts => {
-      const timestamp = Number(ts);
-      return !isNaN(timestamp) && timestamp > windowStart;
-    });
-
-    const currentCount = data.timestamps.length;
-
-    if (currentCount >= this.maxRequests) {
-      const oldestTimestamp = Math.min(...data.timestamps);
-      const resetTime = oldestTimestamp + this.windowMs;
+    // Use atomic operation to prevent race conditions
+    const result = await this.store.atomicIncrement(key, now, windowStart, this.windowMs);
+    
+    // Handle case where store doesn't support atomic operations
+    if (result === null) {
+      // Fallback to non-atomic operation with optimistic locking
+      await this.store.removeExpired(key, windowStart);
+      const count = await this.store.count(key, windowStart, now);
+      
+      if (count >= this.maxRequests) {
+        return {
+          allowed: false,
+          remaining: 0,
+          resetAt: await this.store.getOldestTimestamp(key) + this.windowMs
+        };
+      }
+      
+      await this.store.add(key, now);
       return {
-        allowed: false,
-        remaining: 0,
-        resetAt: resetTime,
-        total: this.maxRequests
+        allowed: true,
+        remaining: Math.max(0, this.maxRequests - count - 1),
+        resetAt: now + this.windowMs
       };
     }
-
-    // Add current timestamp
-    data.timestamps.push(now);
-    await this.store.set(key, data, this.windowMs);
-
+    
+    const allowed = result.count <= this.maxRequests;
     return {
-      allowed: true,
-      remaining: this.maxRequests - currentCount - 1,
-      resetAt: now + this.windowMs,
-      total: this.maxRequests
+      allowed,
+      remaining: Math.max(0, this.maxRequests - result.count),
+      resetAt: result.resetAt || now + this.windowMs
     };
   }
 
   async reset(key) {
-    await this.store.delete(key);
+    await this.store.clear(key);
   }
 }
 
@@ -65,77 +55,107 @@ class TokenBucketLimiter {
   constructor(store, options = {}) {
     this.store = store;
     this.bucketSize = options.bucketSize || 10;
-    this.refillRate = options.refillRate || 1; // tokens per second
-    this.refillInterval = 1000 / this.refillRate;
+    this.refillRate = options.refillRate || 1;
+    this.refillInterval = options.refillInterval || 1000;
   }
 
   async isAllowed(key, tokensRequired = 1) {
+    // Validate tokensRequired
+    if (tokensRequired <= 0) {
+      tokensRequired = 1;
+    }
+    
+    if (tokensRequired > this.bucketSize) {
+      return {
+        allowed: false,
+        remaining: 0,
+        resetAt: Date.now() + (tokensRequired - this.bucketSize) * this.refillInterval / this.refillRate,
+        reason: 'Request exceeds bucket capacity'
+      };
+    }
+    
     const now = Date.now();
-    let data = await this.store.get(key);
-
-    if (!data || typeof data.tokens !== 'number' || isNaN(data.tokens)) {
-      data = {
+    let bucket = await this.store.get(key);
+    
+    if (!bucket || typeof bucket.tokens === 'undefined') {
+      bucket = {
         tokens: this.bucketSize,
         lastRefill: now
       };
     }
-
-    // Ensure lastRefill is valid
-    if (typeof data.lastRefill !== 'number' || isNaN(data.lastRefill)) {
-      data.lastRefill = now;
-    }
-
+    
     // Calculate tokens to add based on time elapsed
-    const timePassed = Math.max(0, now - data.lastRefill);
-    const tokensToAdd = Math.floor(timePassed / this.refillInterval);
+    const elapsed = Math.max(0, now - bucket.lastRefill);
+    const tokensToAdd = Math.floor(elapsed / this.refillInterval) * this.refillRate;
     
-    // Refill bucket (cap at bucket size)
-    data.tokens = Math.min(this.bucketSize, data.tokens + tokensToAdd);
+    // Ensure tokens don't exceed bucket size and handle NaN
+    bucket.tokens = Math.min(
+      this.bucketSize,
+      (isNaN(bucket.tokens) ? 0 : bucket.tokens) + tokensToAdd
+    );
+    bucket.lastRefill = now;
     
-    if (tokensToAdd > 0) {
-      data.lastRefill = now;
-    }
-
-    // Check if enough tokens available
-    if (data.tokens >= tokensRequired) {
-      data.tokens -= tokensRequired;
-      await this.store.set(key, data);
-
+    if (bucket.tokens >= tokensRequired) {
+      bucket.tokens -= tokensRequired;
+      await this.store.set(key, bucket);
+      
       return {
         allowed: true,
-        remaining: Math.floor(data.tokens),
-        resetAt: now + (this.bucketSize - data.tokens) * this.refillInterval,
-        total: this.bucketSize
+        remaining: Math.floor(bucket.tokens),
+        resetAt: now + this.refillInterval
       };
     }
-
+    
+    await this.store.set(key, bucket);
+    
     // Calculate when enough tokens will be available
-    const tokensNeeded = tokensRequired - data.tokens;
-    const waitTime = Math.ceil(tokensNeeded * this.refillInterval);
-
-    await this.store.set(key, data);
-
+    const tokensNeeded = tokensRequired - bucket.tokens;
+    const waitTime = Math.ceil(tokensNeeded / this.refillRate) * this.refillInterval;
+    
     return {
       allowed: false,
-      remaining: Math.floor(data.tokens),
-      resetAt: now + waitTime,
-      total: this.bucketSize
+      remaining: Math.floor(bucket.tokens),
+      resetAt: now + waitTime
     };
   }
 
   async reset(key) {
     await this.store.delete(key);
   }
+  
+  async getStatus(key) {
+    const bucket = await this.store.get(key);
+    if (!bucket) {
+      return {
+        tokens: this.bucketSize,
+        bucketSize: this.bucketSize
+      };
+    }
+    
+    const now = Date.now();
+    const elapsed = Math.max(0, now - bucket.lastRefill);
+    const tokensToAdd = Math.floor(elapsed / this.refillInterval) * this.refillRate;
+    const currentTokens = Math.min(this.bucketSize, bucket.tokens + tokensToAdd);
+    
+    return {
+      tokens: Math.floor(currentTokens),
+      bucketSize: this.bucketSize
+    };
+  }
 }
 
 function createLimiter(type, store, options) {
+  if (!store) {
+    throw new Error('Store is required to create a limiter');
+  }
+  
   switch (type) {
     case 'sliding-window':
       return new SlidingWindowLimiter(store, options);
     case 'token-bucket':
       return new TokenBucketLimiter(store, options);
     default:
-      throw new Error(`Unknown limiter type: ${type}`);
+      throw new Error(`Unknown limiter type: ${type}. Supported types: sliding-window, token-bucket`);
   }
 }
 
