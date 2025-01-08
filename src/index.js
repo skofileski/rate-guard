@@ -1,104 +1,141 @@
 /**
- * rate-guard
- * A lightweight rate limiting middleware with pluggable storage backends
+ * rate-guard - Lightweight rate limiting middleware
  */
 
 const { SlidingWindowLimiter, TokenBucketLimiter } = require('./limiters');
 const { MemoryStore } = require('./stores/memory');
 const { RedisStore } = require('./stores/redis');
 const { MongoStore } = require('./stores/mongo');
-const { RuleEngine } = require('./rules');
+const { RuleEngine, createRule } = require('./rules');
+const { loadConfig, validateConfig, DEFAULT_CONFIG } = require('./config');
+const { TierManager, createTierManager, DEFAULT_TIERS } = require('./tiers');
 
 /**
  * Create rate limiting middleware
  * @param {Object} options - Configuration options
- * @returns {Function} Express middleware function
+ * @returns {Function} Express middleware
  */
 function createRateLimiter(options = {}) {
-  const {
-    store = new MemoryStore(),
-    algorithm = 'sliding-window',
-    windowMs = 60000,
-    maxRequests = 100,
-    keyGenerator = defaultKeyGenerator,
-    tierExtractor = () => null,
-    skipFailedRequests = false,
-    onLimitReached = null,
-    rules = null
-  } = options;
+  const config = { ...DEFAULT_CONFIG, ...options };
+  validateConfig(config);
 
-  const ruleEngine = rules instanceof RuleEngine ? rules : new RuleEngine({
-    windowMs,
-    maxRequests,
-    algorithm
-  });
+  const store = config.store || new MemoryStore();
+  const limiter = config.algorithm === 'token-bucket'
+    ? new TokenBucketLimiter(store, config)
+    : new SlidingWindowLimiter(store, config);
 
-  const limiters = {
-    'sliding-window': (opts) => new SlidingWindowLimiter(store, opts),
-    'token-bucket': (opts) => new TokenBucketLimiter(store, opts)
-  };
+  const ruleEngine = config.ruleEngine || null;
+  const tierManager = config.tierManager || null;
 
   return async function rateLimitMiddleware(req, res, next) {
     try {
-      const tier = await tierExtractor(req);
-      const route = req.path || req.url;
-      const rule = ruleEngine.getRule(route, tier);
-      
-      const key = ruleEngine.generateKey({
-        ip: req.ip || req.connection?.remoteAddress,
-        userId: req.user?.id,
-        route,
-        tier
-      });
+      const identifier = config.keyGenerator
+        ? config.keyGenerator(req)
+        : req.ip || req.connection.remoteAddress;
 
-      const LimiterClass = limiters[rule.algorithm];
-      if (!LimiterClass) {
-        throw new Error(`Unknown algorithm: ${rule.algorithm}`);
+      let effectiveConfig = config;
+
+      // Apply tier-based limits if tier manager is configured
+      if (tierManager) {
+        const tier = await tierManager.resolveTier(req, identifier);
+        effectiveConfig = {
+          ...config,
+          windowMs: tier.windowMs,
+          maxRequests: tier.maxRequests,
+          bucketSize: tier.tokenBucketSize,
+          refillRate: tier.tokenRefillRate
+        };
+        req.rateLimitTier = tier.name;
       }
 
-      const limiter = LimiterClass(rule);
-      const result = await limiter.consume(key);
+      // Apply rule-based limits if rule engine is configured
+      if (ruleEngine) {
+        const ruleConfig = ruleEngine.evaluate(req);
+        if (ruleConfig) {
+          effectiveConfig = { ...effectiveConfig, ...ruleConfig };
+        }
+      }
+
+      // Update limiter config if it changed
+      if (effectiveConfig !== config) {
+        limiter.updateConfig(effectiveConfig);
+      }
+
+      const result = await limiter.consume(identifier);
 
       // Set rate limit headers
-      res.set('X-RateLimit-Limit', result.limit);
-      res.set('X-RateLimit-Remaining', result.remaining);
-      res.set('X-RateLimit-Reset', result.resetTime);
+      res.set('X-RateLimit-Limit', String(effectiveConfig.maxRequests || effectiveConfig.bucketSize));
+      res.set('X-RateLimit-Remaining', String(result.remaining));
+      res.set('X-RateLimit-Reset', String(result.resetTime));
+
+      if (req.rateLimitTier) {
+        res.set('X-RateLimit-Tier', req.rateLimitTier);
+      }
 
       if (!result.allowed) {
-        res.set('Retry-After', Math.ceil((result.resetTime - Date.now()) / 1000));
+        res.set('Retry-After', String(Math.ceil(result.retryAfter / 1000)));
         
-        if (onLimitReached) {
-          return onLimitReached(req, res, next, result);
+        if (config.handler) {
+          return config.handler(req, res, next, result);
         }
 
         return res.status(429).json({
           error: 'Too Many Requests',
-          retryAfter: Math.ceil((result.resetTime - Date.now()) / 1000)
+          message: config.message || 'Rate limit exceeded. Please try again later.',
+          retryAfter: result.retryAfter,
+          tier: req.rateLimitTier || undefined
         });
       }
 
+      req.rateLimit = result;
       next();
     } catch (error) {
-      // Fail open - allow request if rate limiter fails
-      console.error('Rate limiter error:', error);
-      next();
+      if (config.skipOnError) {
+        console.error('Rate limiter error:', error.message);
+        return next();
+      }
+      next(error);
     }
   };
 }
 
 /**
- * Default key generator
+ * Create a rate limiter with tier support
+ * @param {Object} options - Configuration options
+ * @param {Object} tierConfig - Tier configuration
+ * @returns {Function} Express middleware
  */
-function defaultKeyGenerator(req) {
-  return req.ip || req.connection?.remoteAddress || 'unknown';
+function createTieredRateLimiter(options = {}, tierConfig = {}) {
+  const tierManager = createTierManager(tierConfig.tiers);
+  
+  if (tierConfig.resolver) {
+    tierManager.setTierResolver(tierConfig.resolver);
+  }
+  
+  if (tierConfig.assignments) {
+    tierManager.bulkAssign(tierConfig.assignments);
+  }
+  
+  return createRateLimiter({
+    ...options,
+    tierManager
+  });
 }
 
 module.exports = {
   createRateLimiter,
-  RuleEngine,
+  createTieredRateLimiter,
   SlidingWindowLimiter,
   TokenBucketLimiter,
   MemoryStore,
   RedisStore,
-  MongoStore
+  MongoStore,
+  RuleEngine,
+  createRule,
+  TierManager,
+  createTierManager,
+  loadConfig,
+  validateConfig,
+  DEFAULT_CONFIG,
+  DEFAULT_TIERS
 };
