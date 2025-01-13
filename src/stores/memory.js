@@ -1,137 +1,145 @@
+const { BaseStore } = require('./base');
+
 /**
- * In-memory storage adapter for rate limiting
+ * In-memory store adapter using Map
+ * Suitable for single-instance applications
  */
-
-class MemoryStore {
+class MemoryStore extends BaseStore {
   constructor(options = {}) {
-    this.timestamps = new Map();
-    this.buckets = new Map();
-    this.locks = new Map();
+    super(options);
+    this.store = new Map();
     this.cleanupInterval = options.cleanupInterval || 60000;
-    
-    // Periodic cleanup of expired entries
-    this._cleanupTimer = setInterval(() => {
-      this._cleanup();
-    }, this.cleanupInterval);
+    this.cleanupTimer = null;
+    this.hits = 0;
+    this.misses = 0;
   }
 
-  async _acquireLock(key) {
-    while (this.locks.get(key)) {
-      await new Promise(resolve => setTimeout(resolve, 1));
-    }
-    this.locks.set(key, true);
-  }
-
-  _releaseLock(key) {
-    this.locks.delete(key);
-  }
-
-  // Atomic increment for sliding window - prevents race conditions
-  async atomicIncrement(key, now, windowStart, windowMs) {
-    await this._acquireLock(key);
-    
-    try {
-      let timestamps = this.timestamps.get(key) || [];
+  async _connect() {
+    // Start cleanup interval
+    if (this.cleanupInterval > 0) {
+      this.cleanupTimer = setInterval(() => {
+        this.cleanup().catch(() => {});
+      }, this.cleanupInterval);
       
-      // Remove old entries
-      timestamps = timestamps.filter(ts => ts > windowStart);
-      
-      // Add new timestamp
-      timestamps.push(now);
-      
-      this.timestamps.set(key, timestamps);
-      
-      return { count: timestamps.length };
-    } finally {
-      this._releaseLock(key);
-    }
-  }
-
-  // Atomic token bucket operation - prevents race conditions
-  async atomicTokenBucket(key, now, bucketSize, refillRate, tokensRequired) {
-    await this._acquireLock(key);
-    
-    try {
-      let bucket = this.buckets.get(key);
-      
-      if (!bucket) {
-        bucket = {
-          tokens: bucketSize,
-          lastRefill: now
-        };
+      // Don't prevent process exit
+      if (this.cleanupTimer.unref) {
+        this.cleanupTimer.unref();
       }
-
-      // Calculate tokens to add based on time elapsed
-      const elapsed = now - bucket.lastRefill;
-      const tokensToAdd = (elapsed / 1000) * refillRate;
-      bucket.tokens = Math.min(bucketSize, bucket.tokens + tokensToAdd);
-      bucket.lastRefill = now;
-
-      let allowed = false;
-      if (bucket.tokens >= tokensRequired) {
-        bucket.tokens -= tokensRequired;
-        allowed = true;
-      }
-
-      this.buckets.set(key, bucket);
-      
-      return { allowed, tokens: bucket.tokens };
-    } finally {
-      this._releaseLock(key);
     }
   }
 
-  async getTimestamps(key) {
-    return this.timestamps.get(key) || [];
+  async _disconnect() {
+    if (this.cleanupTimer) {
+      clearInterval(this.cleanupTimer);
+      this.cleanupTimer = null;
+    }
+    this.store.clear();
   }
 
-  async addTimestamp(key, timestamp, ttl) {
-    const timestamps = this.timestamps.get(key) || [];
-    timestamps.push(timestamp);
-    this.timestamps.set(key, timestamps);
+  async get(key) {
+    await this.ensureConnection();
+    const prefixedKey = this.prefixKey(key);
+    const entry = this.store.get(prefixedKey);
+    
+    if (!entry) {
+      this.misses++;
+      return 0;
+    }
+    
+    if (Date.now() > entry.expiresAt) {
+      this.store.delete(prefixedKey);
+      this.misses++;
+      return 0;
+    }
+    
+    this.hits++;
+    return entry.count;
   }
 
-  async removeOldEntries(key, windowStart) {
-    const timestamps = this.timestamps.get(key) || [];
-    const filtered = timestamps.filter(ts => ts > windowStart);
-    this.timestamps.set(key, filtered);
-  }
-
-  async clear(key) {
-    this.timestamps.delete(key);
-  }
-
-  async getBucket(key) {
-    return this.buckets.get(key) || null;
-  }
-
-  async setBucket(key, bucket) {
-    this.buckets.set(key, bucket);
-  }
-
-  async deleteBucket(key) {
-    this.buckets.delete(key);
-  }
-
-  _cleanup() {
+  async increment(key, windowMs) {
+    await this.ensureConnection();
+    const prefixedKey = this.prefixKey(key);
     const now = Date.now();
-    const maxAge = 3600000; // 1 hour
-
-    for (const [key, timestamps] of this.timestamps.entries()) {
-      const filtered = timestamps.filter(ts => now - ts < maxAge);
-      if (filtered.length === 0) {
-        this.timestamps.delete(key);
-      } else {
-        this.timestamps.set(key, filtered);
-      }
+    let entry = this.store.get(prefixedKey);
+    
+    if (!entry || now > entry.expiresAt) {
+      entry = {
+        count: 0,
+        createdAt: now,
+        expiresAt: now + windowMs
+      };
     }
+    
+    entry.count++;
+    entry.lastAccess = now;
+    this.store.set(prefixedKey, entry);
+    
+    return entry.count;
   }
 
-  destroy() {
-    clearInterval(this._cleanupTimer);
-    this.timestamps.clear();
-    this.buckets.clear();
-    this.locks.clear();
+  async reset(key) {
+    await this.ensureConnection();
+    const prefixedKey = this.prefixKey(key);
+    this.store.delete(prefixedKey);
+  }
+
+  async getTTL(key) {
+    await this.ensureConnection();
+    const prefixedKey = this.prefixKey(key);
+    const entry = this.store.get(prefixedKey);
+    
+    if (!entry) {
+      return -1;
+    }
+    
+    const ttl = entry.expiresAt - Date.now();
+    return ttl > 0 ? ttl : -1;
+  }
+
+  async cleanup() {
+    const now = Date.now();
+    let cleaned = 0;
+    
+    for (const [key, entry] of this.store.entries()) {
+      if (now > entry.expiresAt) {
+        this.store.delete(key);
+        cleaned++;
+      }
+    }
+    
+    return cleaned;
+  }
+
+  async getStats() {
+    const baseStats = await super.getStats();
+    return {
+      ...baseStats,
+      entries: this.store.size,
+      hits: this.hits,
+      misses: this.misses,
+      hitRate: this.hits + this.misses > 0 
+        ? (this.hits / (this.hits + this.misses) * 100).toFixed(2) + '%'
+        : '0%'
+    };
+  }
+
+  /**
+   * Get all keys matching a pattern (for debugging)
+   * @param {string} pattern
+   * @returns {Promise<string[]>}
+   */
+  async keys(pattern = '*') {
+    await this.ensureConnection();
+    const regex = new RegExp('^' + pattern.replace(/\*/g, '.*') + '$');
+    const keys = [];
+    
+    for (const key of this.store.keys()) {
+      if (regex.test(key)) {
+        keys.push(key);
+      }
+    }
+    
+    return keys;
   }
 }
 
